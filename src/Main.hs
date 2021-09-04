@@ -149,7 +149,7 @@ main = do
       replicateM_ cores (forkIO $ folderWorker input output)
       writeList2Chan input [p]
 
-      rootFolders <- fmap (\p' -> toS $ p </> p') <$> listFolders p
+      rootFolders <- fmap (toS . (p </>)) <$> listFolders p
 
       if null rootFolders
         then hPrintf stderr "No folders found to scan in %s\n" p
