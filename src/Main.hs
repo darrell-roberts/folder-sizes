@@ -1,5 +1,8 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
 module Main where
@@ -11,7 +14,8 @@ import GHC.Conc (getNumProcessors)
 import Protolude
 import System.Directory (
   doesDirectoryExist,
-  doesPathExist,
+  doesFileExist,
+  getFileSize,
   listDirectory,
   pathIsSymbolicLink,
  )
@@ -20,30 +24,44 @@ import System.IO (BufferMode (NoBuffering), hSetBuffering)
 import Text.Printf (hPrintf, printf)
 
 -- | Map of root paths with a tuple of folder and file sizes.
-type ResultMap = Map.HashMap Text (Int, Int)
+type ResultMap = Map.HashMap Text FolderStats
+
+data FolderStats = FolderStats
+  { totalSubFolders :: Int
+  , totalFiles :: Int
+  , totalFileSizes :: Integer
+  }
 
 -- | A file item either a file or a folder.
 data FileItem
   = Folder !FilePath
-  | File !FilePath
+  | File !FilePath !Integer
   deriving (Show)
 
--- | Handler for io exceptions. Print error an return an empty list.
-ioErrorHandler :: FilePath -> IOException -> IO [a]
-ioErrorHandler fp e = do
+-- | Handler for io exceptions. Print error an return default value.
+ioErrorHandler :: FilePath -> a -> IOException -> IO a
+ioErrorHandler fp val e = do
   hPrintf stderr "Error opening %s (%s)\n" fp (displayException (e :: IOException))
-  pure []
+  pure val
 
 -- | List folders from target path.
 listFolders :: FilePath -> IO [FilePath]
 listFolders path = listDirectory path >>= filterM isNormalFolder . fmap (path </>)
 
+tryGetFileSize :: FilePath -> IO Integer
+tryGetFileSize fp =
+  doesFileExist fp &&^ fmap not (pathIsSymbolicLink fp)
+    >>= bool
+      (pure 0)
+      (getFileSize fp `catch` ioErrorHandler fp 0)
+
 -- | List all files in target path. Return empty list on failure.
 tryListDirectory :: FilePath -> IO [FileItem]
 tryListDirectory fp = do
-  allFiles <- fmap (fp </>) <$> listDirectory fp `catch` ioErrorHandler fp
+  allFiles <- fmap (fp </>) <$> listDirectory fp `catch` ioErrorHandler fp []
   folders <- filterM isNormalFolder allFiles
-  pure $ fmap Folder folders <> fmap File (allFiles \\ folders)
+  files <- mapM (\f -> File f <$> tryGetFileSize f) $ allFiles \\ folders
+  pure $ fmap Folder folders <> files
 
 -- | Check if target path is a folder and not a symbolic link.
 isNormalFolder :: FilePath -> IO Bool
@@ -63,15 +81,19 @@ folderWorker input output = forever $ do
   isNormalFolder path
     >>= bool
       (writeChan output (path, []))
-      (tryListDirectory path >>= \fileItems -> writeChan output (path, fileItems))
+      (tryListDirectory path >>= writeChan output . (path,))
 
 -- | Find the root path for the target path.
 getFolderKey :: Text -> [Text] -> Maybe Text
 getFolderKey fullPath = find (`T.isPrefixOf` fullPath)
 
--- | Sum fst and snd values between two tuples.
-sumTuple :: (Num a, Num b) => (a, b) -> (a, b) -> (a, b)
-sumTuple (a, b) (c, d) = (a + c, b + d)
+sumFolderStats :: FolderStats -> FolderStats -> FolderStats
+sumFolderStats fs1 fs2 =
+  fs1
+    { totalFiles = totalFiles fs1 + totalFiles fs2
+    , totalFileSizes = totalFileSizes fs1 + totalFileSizes fs2
+    , totalSubFolders = totalSubFolders fs1 + totalSubFolders fs2
+    }
 
 {- |
   Reads from the output channel the file listing results
@@ -93,19 +115,24 @@ responseWorker input output =
   ask >>= \rootFolders -> do
     let loop = do
           (path, allFiles) <- liftIO $ readChan output
-          let folders = [file | x@(Folder file) <- allFiles]
-              files = [x | x@File{} <- allFiles]
+          let folders = [file | Folder file <- allFiles]
+              files = [n | File _ n <- allFiles]
 
           if not $ null allFiles
             then do
               let totalFiles = length files
                   totalFolders = length folders
+                  totalFileSizes = sum files
                   key = getFolderKey (toS path) rootFolders
 
               maybe
                 (pure ())
                 ( \k ->
-                    modify $ Map.insertWith sumTuple k (totalFiles, totalFolders)
+                    modify $
+                      Map.insertWith
+                        sumFolderStats
+                        k
+                        (FolderStats totalFolders totalFiles totalFileSizes)
                 )
                 key
 
@@ -158,11 +185,15 @@ main = do
           mapM_ putStrLn rootFolders
           printf "\n"
           (_, results) <- runMonadT input output rootFolders
-          uncurry (printf "%s %i files folders %i: \n" p) $
-            Map.foldr sumTuple (0, 0) results
+          Map.foldr sumFolderStats (FolderStats 0 0 0) results
+            & \FolderStats{totalFiles, totalSubFolders, totalFileSizes} ->
+              printf label p totalFiles totalSubFolders totalFileSizes
+
           mapM_
-            ( \(s, (totalFiles, totalFolders)) ->
-                printf "%s files %i folders %i\n" s totalFiles totalFolders
+            ( \(path', FolderStats{totalFiles, totalSubFolders, totalFileSizes}) ->
+                printf label path' totalFiles totalSubFolders totalFileSizes
             )
-            $ (sortOn (Down . snd . snd) . Map.toList) results
+            $ (sortOn (Down . totalFileSizes . snd) . Map.toList) results
     Nothing -> printf "No args.\n"
+ where
+  label = "%s has %i files %i sub folders %i total bytes\n"
