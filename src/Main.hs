@@ -11,13 +11,13 @@ import GHC.Conc (getNumProcessors)
 import Protolude
 import System.Directory (
   doesDirectoryExist,
+  doesPathExist,
   listDirectory,
   pathIsSymbolicLink,
-  doesPathExist
  )
 import System.FilePath.Posix ((</>))
 import System.IO (BufferMode (NoBuffering), hSetBuffering)
-import Text.Printf (printf, hPrintf)
+import Text.Printf (hPrintf, printf)
 
 -- | Map of root paths with a tuple of folder and file sizes.
 type ResultMap = Map.HashMap Text (Int, Int)
@@ -36,7 +36,7 @@ ioErrorHandler fp e = do
 
 -- | List folders from target path.
 listFolders :: FilePath -> IO [FilePath]
-listFolders = listDirectory >=> filterM isNormalFolder
+listFolders path = listDirectory path >>= filterM isNormalFolder . fmap (path </>)
 
 -- | List all files in target path. Return empty list on failure.
 tryListDirectory :: FilePath -> IO [FileItem]
@@ -149,20 +149,20 @@ main = do
       replicateM_ cores (forkIO $ folderWorker input output)
       writeList2Chan input [p]
 
-      rootFolders <- fmap (toS . (p </>)) <$> listFolders p
+      rootFolders <- fmap toS <$> listFolders p
 
       if null rootFolders
         then hPrintf stderr "No folders found to scan in %s\n" p
-      else do
-        printf "Scaning recursively:\n"
-        mapM_ putStrLn rootFolders
-        printf "\n"
-        (_, results) <- runMonadT input output rootFolders
-        uncurry (printf "%s %i files, folders %i: \n" p) $
-          Map.foldr sumTuple (0, 0) results
-        mapM_
-          ( \(s, (totalFiles, totalFolders)) ->
-              printf "Path %s files %i folders %i\n" s totalFiles totalFolders
-          )
-          $ (sortOn (Down . snd . snd) . Map.toList) results
+        else do
+          printf "Scaning recursively:\n"
+          mapM_ putStrLn rootFolders
+          printf "\n"
+          (_, results) <- runMonadT input output rootFolders
+          uncurry (printf "%s %i files folders %i: \n" p) $
+            Map.foldr sumTuple (0, 0) results
+          mapM_
+            ( \(s, (totalFiles, totalFolders)) ->
+                printf "%s files %i folders %i\n" s totalFiles totalFolders
+            )
+            $ (sortOn (Down . snd . snd) . Map.toList) results
     Nothing -> printf "No args.\n"
