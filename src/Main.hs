@@ -27,9 +27,9 @@ import Text.Printf (hPrintf, printf)
 type ResultMap = Map.HashMap Text FolderStats
 
 data FolderStats = FolderStats
-  { totalSubFolders :: Int
-  , totalFiles :: Int
-  , totalFileSizes :: Integer
+  { totalSubFolders :: !Int
+  , totalFiles :: !Int
+  , totalFileSizes :: !Integer
   }
 
 -- | A file item either a file or a folder.
