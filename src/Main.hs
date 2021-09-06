@@ -5,6 +5,16 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 
+{-- |
+  Command line executable that takes a folder path as an argument
+  and recursviley gathers totals for each first level sub-directory
+  found under the path provided.
+
+  Statistics collected:
+    * Total sub-folders
+    * Total files
+    * Total file sizes in bytes
+-}
 module Main where
 
 import Control.Concurrent.STM (
@@ -30,10 +40,15 @@ import System.FilePath.Posix ((</>))
 import System.IO (BufferMode (LineBuffering), hSetBuffering)
 import Text.Printf (hPrintf, printf)
 
-{- | Map of root paths with a tuple of folder and file sizes.
- type ResultMap = TVar (Map.HashMap Text FolderStats)
+{- |
+  Mapping of root folders to folder stats. Values in the
+  map are in a STM transaction variable allowing atomicity
+  when accessing values instead of the entire map.
 -}
-type ResultMap = Map.HashMap Text (TVar FolderStats)
+type FolderStatsMap =
+  Map.HashMap
+    Text -- Root folder.
+    (TVar FolderStats) --  Folder statistics.
 
 data FolderStats = FolderStats
   { totalSubFolders :: !Int
@@ -52,15 +67,36 @@ data AppEnv
   = AppEnv
       ![Text]
       -- ^ Root folders.
-      !ResultMap
+      !FolderStatsMap
       -- ^ Resuls with folder stats
 
-updateFolderStats :: ResultMap -> Text -> FolderStats -> STM ()
+{- |
+  Update the folder stats in the result map by
+  summing the old status with the new stats.
+-}
+updateFolderStats :: FolderStatsMap -> Text -> FolderStats -> STM ()
 updateFolderStats resultMap key folderStats = do
   valTVar <- readTVar ma
   writeTVar ma $ sumFolderStats valTVar folderStats
  where
   ma = resultMap ! key
+
+-- | Build the initial root folders to folder stats mappings.
+populateMap :: [Text] -> STM FolderStatsMap
+populateMap =
+  foldM
+    ( \resultMap rootPath ->
+        newTVar (FolderStats 0 0 0)
+          <&> \folderStats -> Map.insert rootPath folderStats resultMap
+    )
+    Map.empty
+
+-- | Read the TVar value mappings into a new Mapping with the values.
+getResults :: FolderStatsMap -> STM (Map.HashMap Text FolderStats)
+getResults resultMap =
+  fmap Map.fromList
+    <$> mapM (\(k, v) -> (k,) <$> readTVar v)
+    $ Map.toList resultMap
 
 -- | Handler for io exceptions. Print error an return default value.
 ioErrorHandler :: FilePath -> a -> IOException -> IO a
@@ -72,6 +108,7 @@ ioErrorHandler fp val e = do
 listFolders :: FilePath -> IO [FilePath]
 listFolders path = listDirectory path >>= filterM isNormalFolder . fmap (path </>)
 
+-- | Get files size with error handling. Return 0 on failure.
 tryGetFileSize :: FilePath -> IO Integer
 tryGetFileSize fp =
   doesFileExist fp &&^ fmap not (pathIsSymbolicLink fp)
@@ -122,7 +159,10 @@ folderWorker input output =
               case key of
                 Just k ->
                   atomically $
-                    updateFolderStats resultMap k (FolderStats totalFolders totalFiles totalFileSizes)
+                    updateFolderStats
+                      resultMap
+                      k
+                      (FolderStats totalFolders totalFiles totalFileSizes)
                 Nothing -> pure ()
             else pure ()
 
@@ -156,16 +196,20 @@ responseWorker ::
   IO ()
 responseWorker input output = do
   let loop = do
-        allFiles <- snd <$> liftIO (readChan output)
+        allFiles <- snd <$> readChan output
 
         if not $ null allFiles
           then do
             let folders = [file | Folder file <- allFiles]
 
-            liftIO $ writeList2Chan input folders
+            writeList2Chan input folders
             replicateM_ (length folders) loop
           else pure ()
   loop
+
+-- | Display an Integer as Text with comma separators.
+thousandSep :: Integer -> Text
+thousandSep = T.reverse . T.intercalate "," . T.chunksOf 3 . T.reverse . T.pack . show
 
 {- |
   Read the command line argument for path to start recursively
@@ -192,41 +236,41 @@ main =
             output <- newChan
             resultMap <- atomically $ populateMap rootFolders
 
-            replicateM_ cores (forkIO $ runWorker input output (AppEnv rootFolders resultMap))
+            replicateM_
+              cores
+              ( forkIO $
+                  runWorker input output (AppEnv rootFolders resultMap)
+              )
             writeList2Chan input [path]
 
             printf "Scaning %s recursively:\n" path
             mapM_ (printf "  %s\n") rootFolders
             printf "\n"
 
+            let showResults =
+                  sequence_
+                    . sequence
+                      [ showResult . (toS path,) . Map.foldr sumFolderStats (FolderStats 0 0 0)
+                      , mapM_ showResult . sortOn (Down . totalFileSizes . snd) . Map.toList
+                      , const (printf "\n")
+                      ]
+
             responseWorker input output
-            results <- getResults resultMap
-            showResult . (path,) $ Map.foldr sumFolderStats (FolderStats 0 0 0) results
-            mapM_ showResult $
-              (sortOn (Down . totalFileSizes . snd) . Map.toList) results
-            printf "\n"
+            atomically (getResults resultMap) >>= showResults
       Nothing -> printf "No args.\n"
       . head
  where
   label = "%s -> %i files %i sub folders %s total bytes\n"
 
-  showResult (path, FolderStats{totalFiles, totalSubFolders, totalFileSizes}) =
-    printf label path totalFiles totalSubFolders (thousandSep totalFileSizes)
-
-  thousandSep = T.reverse . T.intercalate "," . T.chunksOf 3 . T.reverse . T.pack . show
+  showResult :: (Text, FolderStats) -> IO ()
+  showResult
+    ( path
+      , FolderStats
+          { totalFiles
+          , totalSubFolders
+          , totalFileSizes
+          }
+      ) =
+      printf label path totalFiles totalSubFolders (thousandSep totalFileSizes)
 
   runWorker input output = runReaderT (folderWorker input output)
-
-  populateMap =
-    foldM
-      ( \resultMap rootPath ->
-          newTVar (FolderStats 0 0 0)
-            <&> \folderStats -> Map.insert rootPath folderStats resultMap
-      )
-      Map.empty
-
-  getResults resultMap =
-    atomically $
-      fmap Map.fromList
-        <$> mapM (\(k, v) -> (k,) <$> readTVar v)
-        $ Map.toList resultMap
