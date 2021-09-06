@@ -178,11 +178,11 @@ main :: IO ()
 main =
   getArgs
     >>= \case
-      Just p -> do
-        rootFolders <- fmap toS <$> listFolders p
+      Just path -> do
+        rootFolders <- fmap toS <$> listFolders path
 
         if null rootFolders
-          then hPrintf stderr "No folders found to scan in %s\n" p
+          then hPrintf stderr "No folders found to scan in %s\n" path
           else do
             hSetBuffering stdout LineBuffering
             cores <- getNumProcessors
@@ -190,22 +190,18 @@ main =
             printf "Using %d worker threads.\n" cores
             input <- newChan
             output <- newChan
-
             resultMap <- atomically $ populateMap rootFolders
 
             replicateM_ cores (forkIO $ runWorker input output (AppEnv rootFolders resultMap))
-            writeList2Chan input [p]
+            writeList2Chan input [path]
 
-            printf "Scaning %s recursively:\n" p
+            printf "Scaning %s recursively:\n" path
             mapM_ (printf "  %s\n") rootFolders
             printf "\n"
 
             responseWorker input output
-
             results <- getResults resultMap
-
-            showResult . (p,) $ Map.foldr sumFolderStats (FolderStats 0 0 0) results
-
+            showResult . (path,) $ Map.foldr sumFolderStats (FolderStats 0 0 0) results
             mapM_ showResult $
               (sortOn (Down . totalFileSizes . snd) . Map.toList) results
             printf "\n"
@@ -220,11 +216,12 @@ main =
   thousandSep = T.reverse . T.intercalate "," . T.chunksOf 3 . T.reverse . T.pack . show
 
   runWorker input output = runReaderT (folderWorker input output)
+
   populateMap =
     foldM
       ( \resultMap rootPath ->
-          (\folderStats -> Map.insert rootPath folderStats resultMap)
-            <$> newTVar (FolderStats 0 0 0)
+          newTVar (FolderStats 0 0 0)
+            <&> \folderStats -> Map.insert rootPath folderStats resultMap
       )
       Map.empty
 
