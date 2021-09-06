@@ -196,7 +196,7 @@ main =
             replicateM_ cores (forkIO $ runWorker input output (AppEnv rootFolders resultMap))
             writeList2Chan input [p]
 
-            printf "Scaning recursively:\n"
+            printf "Scaning %s recursively:\n" p
             mapM_ (printf "  %s\n") rootFolders
             printf "\n"
 
@@ -212,7 +212,7 @@ main =
       Nothing -> printf "No args.\n"
       . head
  where
-  label = "%s has %i files %i sub folders %s total bytes\n"
+  label = "%s -> %i files %i sub folders %s total bytes\n"
 
   showResult (path, FolderStats{totalFiles, totalSubFolders, totalFileSizes}) =
     printf label path totalFiles totalSubFolders (thousandSep totalFileSizes)
