@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
@@ -6,6 +7,13 @@
 
 module Main where
 
+import Control.Concurrent.STM (
+  TVar,
+  newTVar,
+  readTVar,
+  writeTVar,
+ )
+import Data.HashMap.Strict ((!))
 import qualified Data.HashMap.Strict as Map
 import Data.List ((\\))
 import qualified Data.Text as T
@@ -19,11 +27,13 @@ import System.Directory (
   pathIsSymbolicLink,
  )
 import System.FilePath.Posix ((</>))
-import System.IO (BufferMode (NoBuffering), hSetBuffering)
+import System.IO (BufferMode (LineBuffering), hSetBuffering)
 import Text.Printf (hPrintf, printf)
 
--- | Map of root paths with a tuple of folder and file sizes.
-type ResultMap = Map.HashMap Text FolderStats
+{- | Map of root paths with a tuple of folder and file sizes.
+ type ResultMap = TVar (Map.HashMap Text FolderStats)
+-}
+type ResultMap = Map.HashMap Text (TVar FolderStats)
 
 data FolderStats = FolderStats
   { totalSubFolders :: !Int
@@ -36,6 +46,21 @@ data FileItem
   = Folder !FilePath
   | File !FilePath !Integer
   deriving (Show)
+
+-- | Application Environment
+data AppEnv
+  = AppEnv
+      ![Text]
+      -- ^ Root folders.
+      !ResultMap
+      -- ^ Resuls with folder stats
+
+updateFolderStats :: ResultMap -> Text -> FolderStats -> STM ()
+updateFolderStats resultMap key folderStats = do
+  valTVar <- readTVar ma
+  writeTVar ma $ sumFolderStats valTVar folderStats
+ where
+  ma = resultMap ! key
 
 -- | Handler for io exceptions. Print error an return default value.
 ioErrorHandler :: FilePath -> a -> IOException -> IO a
@@ -72,20 +97,43 @@ isNormalFolder = (&&^) <$> doesDirectoryExist <*> fmap not . pathIsSymbolicLink
   channel.
 -}
 folderWorker ::
+  (MonadReader AppEnv m, MonadIO m) =>
   Chan FilePath ->
   Chan (FilePath, [FileItem]) ->
-  IO ()
-folderWorker input output = forever $ do
-  path <- readChan input
-  isNormalFolder path
-    >>= bool
-      (writeChan output (path, []))
-      (tryListDirectory path >>= writeChan output . (path,))
+  m ()
+folderWorker input output =
+  ask >>= \(AppEnv rootFolders resultMap) -> liftIO $
+    forever $ do
+      path <- readChan input
+      b <- isNormalFolder path
+      if b
+        then do
+          fileItems <- tryListDirectory path
+          let folders = [file | Folder file <- fileItems]
+              files = [n | File _ n <- fileItems]
+
+          if not $ null fileItems
+            then do
+              let totalFiles = length files
+                  totalFolders = length folders
+                  totalFileSizes = sum files
+                  key = getFolderKey (toS path) rootFolders
+
+              case key of
+                Just k ->
+                  atomically $
+                    updateFolderStats resultMap k (FolderStats totalFolders totalFiles totalFileSizes)
+                Nothing -> pure ()
+            else pure ()
+
+          writeChan output (path, fileItems)
+        else writeChan output (path, [])
 
 -- | Find the root path for the target path.
 getFolderKey :: Text -> [Text] -> Maybe Text
 getFolderKey fullPath = find (`T.isPrefixOf` fullPath)
 
+-- | Sum up two folder stats.
 sumFolderStats :: FolderStats -> FolderStats -> FolderStats
 sumFolderStats fs1 fs2 =
   fs1
@@ -96,62 +144,28 @@ sumFolderStats fs1 fs2 =
 
 {- |
   Reads from the output channel the file listing results
-  and sets the counts in a HashMap. Recursively writes
-  to the input channel all folder files from each response
-  until no more nested folders are found.
+  and recursively writes to the input channel all
+  folder files from each response until no more nested
+  folders are found.
 -}
 responseWorker ::
-  ( MonadReader [Text] m
-  , MonadIO m
-  , MonadState ResultMap m
-  ) =>
   -- | input channel.
   Chan FilePath ->
   -- | response channel.
   Chan (FilePath, [FileItem]) ->
-  m ()
-responseWorker input output =
-  ask >>= \rootFolders -> do
-    let loop = do
-          (path, allFiles) <- liftIO $ readChan output
-          let folders = [file | Folder file <- allFiles]
-              files = [n | File _ n <- allFiles]
+  IO ()
+responseWorker input output = do
+  let loop = do
+        allFiles <- snd <$> liftIO (readChan output)
 
-          if not $ null allFiles
-            then do
-              let totalFiles = length files
-                  totalFolders = length folders
-                  totalFileSizes = sum files
-                  key = getFolderKey (toS path) rootFolders
+        if not $ null allFiles
+          then do
+            let folders = [file | Folder file <- allFiles]
 
-              maybe
-                (pure ())
-                ( \k ->
-                    modify $
-                      Map.insertWith
-                        sumFolderStats
-                        k
-                        (FolderStats totalFolders totalFiles totalFileSizes)
-                )
-                key
-
-              liftIO $ writeList2Chan input folders
-              replicateM_ totalFolders loop
-            else pure ()
-    loop
-
--- | Compose monad transformers and run app in environment
-runMonadT ::
-  MonadIO m =>
-  -- | Input channel
-  Chan FilePath ->
-  -- | Output channel
-  Chan (FilePath, [FileItem]) ->
-  -- | List of file paths
-  [Text] ->
-  -- | Map of root paths with file and folder counts
-  m ((), ResultMap)
-runMonadT input output = runReaderT (runStateT (responseWorker input output) Map.empty)
+            liftIO $ writeList2Chan input folders
+            replicateM_ (length folders) loop
+          else pure ()
+  loop
 
 {- |
   Read the command line argument for path to start recursively
@@ -161,38 +175,61 @@ runMonadT input output = runReaderT (runStateT (responseWorker input output) Map
   concurrent input and output channel.
 -}
 main :: IO ()
-main = do
-  path <- head <$> getArgs
-  hSetBuffering stdout NoBuffering
+main =
+  getArgs
+    >>= \case
+      Just p -> do
+        rootFolders <- fmap toS <$> listFolders p
 
-  case path of
-    Just p -> do
-      cores <- getNumProcessors
-      setNumCapabilities cores
-      printf "Using %d worker threads per worker\n" cores
-      input <- newChan
-      output <- newChan
-      replicateM_ cores (forkIO $ folderWorker input output)
-      writeList2Chan input [p]
+        if null rootFolders
+          then hPrintf stderr "No folders found to scan in %s\n" p
+          else do
+            hSetBuffering stdout LineBuffering
+            cores <- getNumProcessors
+            setNumCapabilities cores
+            printf "Using %d worker threads.\n" cores
+            input <- newChan
+            output <- newChan
 
-      rootFolders <- fmap toS <$> listFolders p
+            resultMap <- atomically $ populateMap rootFolders
 
-      if null rootFolders
-        then hPrintf stderr "No folders found to scan in %s\n" p
-        else do
-          printf "Scaning recursively:\n"
-          mapM_ putStrLn rootFolders
-          printf "\n"
-          (_, results) <- runMonadT input output rootFolders
-          Map.foldr sumFolderStats (FolderStats 0 0 0) results
-            & \FolderStats{totalFiles, totalSubFolders, totalFileSizes} ->
-              printf label p totalFiles totalSubFolders totalFileSizes
+            replicateM_ cores (forkIO $ runWorker input output (AppEnv rootFolders resultMap))
+            writeList2Chan input [p]
 
-          mapM_
-            ( \(path', FolderStats{totalFiles, totalSubFolders, totalFileSizes}) ->
-                printf label path' totalFiles totalSubFolders totalFileSizes
-            )
-            $ (sortOn (Down . totalFileSizes . snd) . Map.toList) results
-    Nothing -> printf "No args.\n"
+            printf "Scaning recursively:\n"
+            mapM_ (printf "  %s\n") rootFolders
+            printf "\n"
+
+            responseWorker input output
+
+            results <- getResults resultMap
+
+            showResult . (p,) $ Map.foldr sumFolderStats (FolderStats 0 0 0) results
+
+            mapM_ showResult $
+              (sortOn (Down . totalFileSizes . snd) . Map.toList) results
+            printf "\n"
+      Nothing -> printf "No args.\n"
+      . head
  where
-  label = "%s has %i files %i sub folders %i total bytes\n"
+  label = "%s has %i files %i sub folders %s total bytes\n"
+
+  showResult (path, FolderStats{totalFiles, totalSubFolders, totalFileSizes}) =
+    printf label path totalFiles totalSubFolders (thousandSep totalFileSizes)
+
+  thousandSep = T.reverse . T.intercalate "," . T.chunksOf 3 . T.reverse . T.pack . show
+
+  runWorker input output = runReaderT (folderWorker input output)
+  populateMap =
+    foldM
+      ( \resultMap rootPath ->
+          (\folderStats -> Map.insert rootPath folderStats resultMap)
+            <$> newTVar (FolderStats 0 0 0)
+      )
+      Map.empty
+
+  getResults resultMap =
+    atomically $
+      fmap Map.fromList
+        <$> mapM (\(k, v) -> (k,) <$> readTVar v)
+        $ Map.toList resultMap
