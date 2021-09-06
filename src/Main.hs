@@ -250,7 +250,7 @@ main =
             let showResults =
                   sequence_
                     . sequence
-                      [ showResult . (toS path,) . Map.foldr sumFolderStats (FolderStats 0 0 0)
+                      [ showResult . (path,) . Map.foldr sumFolderStats (FolderStats 0 0 0)
                       , mapM_ showResult . sortOn (Down . totalFileSizes . snd) . Map.toList
                       , const (printf "\n")
                       ]
@@ -262,7 +262,6 @@ main =
  where
   label = "%s -> %i files %i sub folders %s total bytes\n"
 
-  showResult :: (Text, FolderStats) -> IO ()
   showResult
     ( path
       , FolderStats
